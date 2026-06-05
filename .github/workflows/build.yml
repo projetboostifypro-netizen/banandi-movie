@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,27 +36,24 @@ jobs:
             https://github.com/${{ github.repository }}/releases/download/source-apk/original.apk \
             -O original.apk
           ls -lh original.apk
-          echo "✅ APK downloaded: $(du -sh original.apk | cut -f1)"
 
       - name: Decode APK with Apktool
         run: |
           apktool d original.apk -o apk_decoded --force
-          echo "✅ APK decoded"
-          ls apk_decoded/
 
       - name: Change app name to Banandi Movie
         run: |
           if [ -f "apk_decoded/res/values/strings.xml" ]; then
             sed -i 's|<string name="app_name">.*</string>|<string name="app_name">Banandi Movie</string>|g' \
               apk_decoded/res/values/strings.xml
-            echo "✅ App name updated:"
+            echo "✅ App name:"
             grep "app_name" apk_decoded/res/values/strings.xml
           fi
 
       - name: Rebuild APK
         run: |
           apktool b apk_decoded -o banandi-movie-unsigned.apk
-          echo "✅ APK rebuilt: $(du -sh banandi-movie-unsigned.apk | cut -f1)"
+          echo "✅ Rebuilt: $(du -sh banandi-movie-unsigned.apk | cut -f1)"
 
       - name: Generate signing keystore
         run: |
@@ -67,7 +67,6 @@ jobs:
             -storepass banandi2024 \
             -keypass banandi2024 \
             -noprompt
-          echo "✅ Keystore generated"
 
       - name: Sign APK
         run: |
@@ -78,17 +77,14 @@ jobs:
             -sigalg SHA256withRSA \
             -digestalg SHA-256 \
             banandi-movie-unsigned.apk banandi
-          echo "✅ APK signed"
 
       - name: Zipalign APK
         run: |
           sudo apt-get install -y zipalign -qq 2>/dev/null || true
           if command -v zipalign &> /dev/null; then
             zipalign -v 4 banandi-movie-unsigned.apk banandi-movie.apk
-            echo "✅ APK aligned"
           else
             cp banandi-movie-unsigned.apk banandi-movie.apk
-            echo "⚠️ zipalign not found, using unaligned APK"
           fi
           ls -lh banandi-movie.apk
 
@@ -114,7 +110,4 @@ jobs:
 
             > Compatible Android 7.0+ | Connexion internet requise
           files: banandi-movie.apk
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
