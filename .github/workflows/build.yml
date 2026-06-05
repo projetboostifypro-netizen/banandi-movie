@@ -1,4 +1,4 @@
-name: Build Banandi Movie APK
+name: Build OnE+ Movie APK
 
 on:
   push:
@@ -22,6 +22,13 @@ jobs:
           java-version: '11'
           distribution: 'temurin'
 
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y imagemagick webp zipalign -qq
+          convert --version | head -1
+          echo "✅ ImageMagick ready"
+
       - name: Install Apktool
         run: |
           wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O /tmp/apktool.jar
@@ -36,78 +43,291 @@ jobs:
             https://github.com/${{ github.repository }}/releases/download/source-apk/original.apk \
             -O original.apk
           ls -lh original.apk
+          echo "✅ APK downloaded"
 
       - name: Decode APK with Apktool
         run: |
-          apktool d original.apk -o apk_decoded --force
+          apktool d original.apk -o decoded --force
+          echo "✅ APK decoded"
+          ls decoded/
 
-      - name: Change app name to Banandi Movie
+      # ============================================================
+      # STEP 1 — RENAME APP TO OnE+ movie
+      # ============================================================
+      - name: Rename app to OnE+ movie
         run: |
-          if [ -f "apk_decoded/res/values/strings.xml" ]; then
-            sed -i 's|<string name="app_name">.*</string>|<string name="app_name">Banandi Movie</string>|g' \
-              apk_decoded/res/values/strings.xml
-            echo "✅ App name:"
-            grep "app_name" apk_decoded/res/values/strings.xml
+          # Main strings.xml
+          sed -i 's|<string name="app_name">.*</string>|<string name="app_name">OnE+ movie</string>|g' \
+            decoded/res/values/strings.xml
+          echo "✅ App name → OnE+ movie"
+          grep "app_name" decoded/res/values/strings.xml
+
+      # ============================================================
+      # STEP 2 — REMOVE "LE MIEN" TAB
+      # ============================================================
+      - name: Remove Mine tab - make tab invisible
+        run: |
+          # 1. Empty the tab label
+          sed -i 's|<string name="main_tab_mine">.*</string>|<string name="main_tab_mine"> </string>|g' \
+            decoded/res/values/strings.xml
+          echo "✅ Mine tab label cleared"
+
+          # 2. Replace fragment_mine.xml with a blank invisible layout
+          cat > decoded/res/layout/fragment_mine.xml << 'LAYOUT'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@color/theme_bg_color"
+              android:visibility="gone">
+          </FrameLayout>
+          LAYOUT
+          echo "✅ Mine fragment replaced with blank layout"
+
+          # 3. Replace activity_edit_mine.xml with blank layout
+          cat > decoded/res/layout/activity_edit_mine.xml << 'LAYOUT'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@color/theme_bg_color">
+          </FrameLayout>
+          LAYOUT
+          echo "✅ Edit mine activity replaced"
+
+      - name: Replace Mine tab icons with transparent images
+        run: |
+          # Create a 1x1 transparent PNG
+          convert -size 48x48 xc:none /tmp/transparent.png
+
+          # Replace mine tab icons in all densities
+          for dir in decoded/res/drawable-xxhdpi decoded/res/drawable-xxxhdpi; do
+            if [ -f "$dir/ic_tab_mine.png" ]; then
+              cp /tmp/transparent.png "$dir/ic_tab_mine.png"
+              echo "✅ Replaced $dir/ic_tab_mine.png"
+            fi
+            if [ -f "$dir/ic_tab_mine_selector.png" ]; then
+              cp /tmp/transparent.png "$dir/ic_tab_mine_selector.png"
+              echo "✅ Replaced $dir/ic_tab_mine_selector.png"
+            fi
+          done
+
+      # ============================================================
+      # STEP 3 — REMOVE PROMOTION PAGE
+      # ============================================================
+      - name: Remove Promotion page
+        run: |
+          # Empty promotion strings
+          sed -i 's|<string name="str_mine_extension">.*</string>|<string name="str_mine_extension"> </string>|g' \
+            decoded/res/values/strings.xml
+          sed -i 's|<string name="str_promotion">.*</string>|<string name="str_promotion"> </string>|g' \
+            decoded/res/values/strings.xml
+          sed -i 's|<string name="str_share_intro">.*</string>|<string name="str_share_intro"> </string>|g' \
+            decoded/res/values/strings.xml
+          sed -i 's|<string name="str_extension_histroy">.*</string>|<string name="str_extension_histroy"> </string>|g' \
+            decoded/res/values/strings.xml
+          echo "✅ Promotion strings cleared"
+
+          # Replace pop_layout_edit_mine.xml (mine edit popup - contains promotion)
+          cat > decoded/res/layout/pop_layout_edit_mine.xml << 'LAYOUT'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:visibility="gone">
+          </FrameLayout>
+          LAYOUT
+          echo "✅ Mine edit popup replaced"
+
+      # ============================================================
+      # STEP 4 — GENERATE NEW OnE+ LOGO
+      # ============================================================
+      - name: Generate OnE+ movie logo
+        run: |
+          mkdir -p /tmp/logos
+
+          # Generate base logo: dark background + "OnE+" text + movie design
+          generate_logo() {
+            local SIZE=$1
+            local OUTPUT=$2
+            convert \
+              -size ${SIZE}x${SIZE} \
+              gradient:'#0a0a1a-#1a1040' \
+              -fill '#FF6B00' \
+              -stroke '#FF9500' \
+              -strokewidth 2 \
+              -font DejaVu-Sans-Bold \
+              -pointsize $(( SIZE * 32 / 100 )) \
+              -gravity Center \
+              -annotate +0-$(( SIZE * 8 / 100 )) "OnE+" \
+              -fill '#CCCCCC' \
+              -font DejaVu-Sans \
+              -pointsize $(( SIZE * 14 / 100 )) \
+              -annotate +0+$(( SIZE * 28 / 100 )) "movie" \
+              -fill '#FF6B00' \
+              -draw "rectangle $(( SIZE * 10 / 100 )),$(( SIZE * 78 / 100 )) $(( SIZE * 90 / 100 )),$(( SIZE * 80 / 100 ))" \
+              "$OUTPUT"
+            echo "✅ Generated ${SIZE}x${SIZE} logo: $OUTPUT"
+          }
+
+          # Generate all densities
+          generate_logo 48  /tmp/logos/mdpi.png
+          generate_logo 72  /tmp/logos/hdpi.png
+          generate_logo 96  /tmp/logos/xhdpi.png
+          generate_logo 144 /tmp/logos/xxhdpi.png
+          generate_logo 192 /tmp/logos/xxxhdpi.png
+
+      - name: Replace app launcher icons with OnE+ logo
+        run: |
+          # Convert PNG to WebP and replace all launcher icons
+          declare -A DENSITIES=(
+            ["mdpi"]="48"
+            ["hdpi"]="72"
+            ["xhdpi"]="96"
+            ["xxhdpi"]="144"
+            ["xxxhdpi"]="192"
+          )
+
+          for DENSITY in "${!DENSITIES[@]}"; do
+            SIZE="${DENSITIES[$DENSITY]}"
+            DIR="decoded/res/mipmap-${DENSITY}"
+            if [ -d "$DIR" ]; then
+              # Convert PNG to WebP
+              cwebp -quiet /tmp/logos/${DENSITY}.png -o "$DIR/ic_launcher.webp" 2>/dev/null || \
+                convert /tmp/logos/${DENSITY}.png "$DIR/ic_launcher.webp"
+              cwebp -quiet /tmp/logos/${DENSITY}.png -o "$DIR/ic_launcher_round.webp" 2>/dev/null || \
+                convert /tmp/logos/${DENSITY}.png "$DIR/ic_launcher_round.webp"
+              cwebp -quiet /tmp/logos/${DENSITY}.png -o "$DIR/ic_launcher_foreground.webp" 2>/dev/null || \
+                convert /tmp/logos/${DENSITY}.png "$DIR/ic_launcher_foreground.webp"
+              echo "✅ Replaced icons in $DIR"
+            fi
+          done
+
+      # ============================================================
+      # STEP 5 — GENERATE NEW SPLASH SCREEN
+      # ============================================================
+      - name: Generate OnE+ splash screen
+        run: |
+          # Create a full HD splash screen with OnE+ movie branding
+          convert \
+            -size 1080x1920 \
+            gradient:'#05050f-#0d0d2b' \
+            -fill '#FF6B00' \
+            -font DejaVu-Sans-Bold \
+            -pointsize 160 \
+            -gravity Center \
+            -annotate +0-120 "OnE+" \
+            -fill '#FFFFFF' \
+            -font DejaVu-Sans \
+            -pointsize 70 \
+            -annotate +0+60 "movie" \
+            -fill '#FF6B00' \
+            -draw "rectangle 340,1050 740,1056" \
+            -fill '#444466' \
+            -font DejaVu-Sans \
+            -pointsize 35 \
+            -annotate +0+200 "Streaming illimité" \
+            /tmp/logos/splash.png
+
+          # Replace splash image (used as ic_splash_window_temp)
+          if [ -f "decoded/res/drawable-xxhdpi/ic_splash_window_temp.png" ]; then
+            cp /tmp/logos/splash.png decoded/res/drawable-xxhdpi/ic_splash_window_temp.png
+            echo "✅ Splash screen replaced"
+          else
+            # Find and replace in any drawable folder
+            find decoded/res/ -name "ic_splash_window_temp.png" -exec cp /tmp/logos/splash.png {} \;
+            echo "✅ Splash screen replaced (searched all densities)"
           fi
+
+          # Also update splash background color to match dark theme
+          if grep -q "ic_splash_color" decoded/res/values/colors.xml 2>/dev/null; then
+            sed -i 's|<color name="ic_splash_color">.*</color>|<color name="ic_splash_color">#05050f</color>|g' \
+              decoded/res/values/colors.xml
+            echo "✅ Splash background color updated"
+          fi
+
+      # ============================================================
+      # STEP 6 — BUILD, SIGN & RELEASE
+      # ============================================================
+      - name: Verify changes before rebuild
+        run: |
+          echo "=== App name ==="
+          grep "app_name" decoded/res/values/strings.xml
+          echo "=== Mine tab ==="
+          grep "main_tab_mine" decoded/res/values/strings.xml
+          echo "=== Promotion ==="
+          grep "str_promotion\|str_mine_extension" decoded/res/values/strings.xml
+          echo "=== Icons ==="
+          ls -lh decoded/res/mipmap-xxhdpi/
 
       - name: Rebuild APK
         run: |
-          apktool b apk_decoded -o banandi-movie-unsigned.apk
-          echo "✅ Rebuilt: $(du -sh banandi-movie-unsigned.apk | cut -f1)"
+          apktool b decoded -o one-plus-movie-unsigned.apk
+          ls -lh one-plus-movie-unsigned.apk
+          echo "✅ APK rebuilt"
 
       - name: Generate signing keystore
         run: |
           keytool -genkey -v \
-            -keystore banandi.keystore \
-            -alias banandi \
+            -keystore one-plus.keystore \
+            -alias oneplus \
             -keyalg RSA \
             -keysize 2048 \
             -validity 10000 \
-            -dname "CN=Banandi Movie, OU=Dev, O=Banandi, L=Paris, ST=IDF, C=FR" \
-            -storepass banandi2024 \
-            -keypass banandi2024 \
+            -dname "CN=OnE+ Movie, OU=Dev, O=OnEPlus, L=Paris, ST=IDF, C=FR" \
+            -storepass oneplus2024 \
+            -keypass oneplus2024 \
             -noprompt
+          echo "✅ Keystore generated"
 
       - name: Sign APK
         run: |
           jarsigner \
-            -keystore banandi.keystore \
-            -storepass banandi2024 \
-            -keypass banandi2024 \
+            -keystore one-plus.keystore \
+            -storepass oneplus2024 \
+            -keypass oneplus2024 \
             -sigalg SHA256withRSA \
             -digestalg SHA-256 \
-            banandi-movie-unsigned.apk banandi
+            one-plus-movie-unsigned.apk oneplus
+          echo "✅ APK signed"
 
       - name: Zipalign APK
         run: |
-          sudo apt-get install -y zipalign -qq 2>/dev/null || true
           if command -v zipalign &> /dev/null; then
-            zipalign -v 4 banandi-movie-unsigned.apk banandi-movie.apk
+            zipalign -v 4 one-plus-movie-unsigned.apk one-plus-movie.apk
+            echo "✅ APK aligned"
           else
-            cp banandi-movie-unsigned.apk banandi-movie.apk
+            cp one-plus-movie-unsigned.apk one-plus-movie.apk
           fi
-          ls -lh banandi-movie.apk
+          ls -lh one-plus-movie.apk
 
-      - name: Upload APK as workflow artifact
+      - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Banandi-Movie-APK
-          path: banandi-movie.apk
+          name: OnE-Plus-Movie-APK
+          path: one-plus-movie.apk
           retention-days: 90
 
-      - name: Create Release with compiled APK
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: "🎬 Banandi Movie v1.0.${{ github.run_number }}"
+          tag_name: v2.0.${{ github.run_number }}
+          name: "🎬 OnE+ movie v2.0.${{ github.run_number }}"
           body: |
-            ## 🎬 Banandi Movie v1.0.${{ github.run_number }}
+            ## 🎬 OnE+ movie v2.0.${{ github.run_number }}
+
+            ### Changements
+            - ✅ Renommée **OnE+ movie**
+            - ✅ Onglet "Le mien" supprimé
+            - ✅ Page "Promotion" supprimée
+            - ✅ Nouveau logo **OnE+**
+            - ✅ Nouvel écran de démarrage
 
             ### Installation Android
-            1. Téléchargez **banandi-movie.apk** ci-dessous
-            2. Sur votre Android : **Paramètres → Sécurité → Sources inconnues** ✅
+            1. Téléchargez **one-plus-movie.apk** ci-dessous
+            2. **Paramètres → Sécurité → Sources inconnues** ✅
             3. Ouvrez le fichier APK et installez
 
             > Compatible Android 7.0+ | Connexion internet requise
-          files: banandi-movie.apk
+          files: one-plus-movie.apk
           token: ${{ secrets.GITHUB_TOKEN }}
