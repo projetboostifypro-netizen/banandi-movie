@@ -266,6 +266,12 @@ jobs:
           ls -lh one-plus-movie-unsigned.apk
           echo "✅ APK rebuilt"
 
+      - name: Download uber-apk-signer
+        run: |
+          wget -q https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar \
+            -O /tmp/uber-apk-signer.jar
+          echo "✅ uber-apk-signer ready"
+
       - name: Generate signing keystore
         run: |
           keytool -genkey -v \
@@ -274,32 +280,31 @@ jobs:
             -keyalg RSA \
             -keysize 2048 \
             -validity 10000 \
-            -dname "CN=OnEPlus Movie, OU=Dev, O=OnEPlus, L=Paris, ST=IDF, C=FR" \
+            -dname "CN=OnEPlus, OU=Dev, O=OnEPlus, L=Paris, ST=IDF, C=FR" \
             -storepass oneplus2024 \
             -keypass oneplus2024 \
             -noprompt
           echo "✅ Keystore generated"
 
-      - name: Sign APK
+      - name: Sign APK (V1 + V2 + V3)
         run: |
-          jarsigner \
-            -keystore one-plus.keystore \
-            -storepass oneplus2024 \
-            -keypass oneplus2024 \
-            -sigalg SHA256withRSA \
-            -digestalg SHA-256 \
-            one-plus-movie-unsigned.apk oneplus
-          echo "✅ APK signed"
-
-      - name: Zipalign APK
-        run: |
-          if command -v zipalign &> /dev/null; then
-            zipalign -v 4 one-plus-movie-unsigned.apk one-plus-movie.apk
-            echo "✅ APK aligned"
-          else
-            cp one-plus-movie-unsigned.apk one-plus-movie.apk
+          java -jar /tmp/uber-apk-signer.jar \
+            --apks one-plus-movie-unsigned.apk \
+            --ks one-plus.keystore \
+            --ksAlias oneplus \
+            --ksKeyPass oneplus2024 \
+            --ksPass oneplus2024 \
+            --allowResign \
+            --out .
+          # uber-apk-signer outputs as *-aligned-signed.apk
+          SIGNED=$(ls *-aligned-signed.apk 2>/dev/null | head -1)
+          if [ -z "$SIGNED" ]; then
+            SIGNED=$(ls *signed*.apk 2>/dev/null | head -1)
           fi
+          echo "Signed file: $SIGNED"
+          cp "$SIGNED" one-plus-movie.apk
           ls -lh one-plus-movie.apk
+          echo "✅ APK signed V1+V2+V3 and aligned"
 
       - name: Upload APK as artifact
         uses: actions/upload-artifact@v4
