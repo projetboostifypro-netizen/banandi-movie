@@ -1,0 +1,154 @@
+name: Build Banandi Movie APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'URL directe vers l APK original (optionnel)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Java 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Install Apktool
+        run: |
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O /tmp/apktool.jar
+          echo '#!/bin/bash' > /tmp/apktool
+          echo 'java -jar /tmp/apktool.jar "$@"' >> /tmp/apktool
+          chmod +x /tmp/apktool
+          sudo mv /tmp/apktool /usr/local/bin/apktool
+
+      - name: Download APK if URL provided
+        if: ${{ github.event.inputs.apk_url != '' }}
+        run: |
+          wget -q "${{ github.event.inputs.apk_url }}" -O apk/original.apk
+          echo "APK downloaded from URL"
+
+      - name: Verify APK exists
+        run: |
+          if [ ! -f "apk/original.apk" ]; then
+            echo "ERROR: apk/original.apk not found!"
+            echo "Please add the original APK file to the apk/ folder and push again."
+            exit 1
+          fi
+          ls -lh apk/original.apk
+          echo "APK found, size: $(du -sh apk/original.apk | cut -f1)"
+
+      - name: Decode APK with Apktool
+        run: |
+          apktool d apk/original.apk -o apk_decoded --force
+          echo "Decoded successfully"
+          ls apk_decoded/
+
+      - name: Change app name to Banandi Movie
+        run: |
+          # Main strings.xml
+          if [ -f "apk_decoded/res/values/strings.xml" ]; then
+            sed -i 's|<string name="app_name">.*</string>|<string name="app_name">Banandi Movie</string>|g' apk_decoded/res/values/strings.xml
+            echo "✅ App name changed in strings.xml"
+            grep "app_name" apk_decoded/res/values/strings.xml
+          fi
+          
+          # AndroidManifest label
+          sed -i 's|android:label="@string/app_name"|android:label="Banandi Movie"|g' apk_decoded/AndroidManifest.xml 2>/dev/null || true
+
+      - name: Change package name display (keep original for compatibility)
+        run: |
+          echo "Package remains com.mfr.moviefr for server compatibility"
+          grep "package=" apk_decoded/AndroidManifest.xml | head -3
+
+      - name: Rebuild APK
+        run: |
+          apktool b apk_decoded -o banandi-movie-unsigned.apk
+          echo "✅ APK rebuilt"
+          ls -lh banandi-movie-unsigned.apk
+
+      - name: Generate signing keystore
+        run: |
+          keytool -genkey -v \
+            -keystore banandi.keystore \
+            -alias banandi \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Banandi Movie, OU=Dev, O=Banandi, L=Paris, ST=IDF, C=FR" \
+            -storepass banandi2024 \
+            -keypass banandi2024 \
+            -noprompt
+          echo "✅ Keystore generated"
+
+      - name: Sign APK with jarsigner
+        run: |
+          jarsigner \
+            -keystore banandi.keystore \
+            -storepass banandi2024 \
+            -keypass banandi2024 \
+            -sigalg SHA256withRSA \
+            -digestalg SHA-256 \
+            banandi-movie-unsigned.apk \
+            banandi
+          echo "✅ APK signed"
+
+      - name: Zipalign APK
+        run: |
+          # Try to get zipalign from Android SDK or install it
+          if ! command -v zipalign &> /dev/null; then
+            sudo apt-get install -y zipalign 2>/dev/null || \
+            wget -q https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar -O /tmp/uber-signer.jar
+          fi
+          
+          if command -v zipalign &> /dev/null; then
+            zipalign -v 4 banandi-movie-unsigned.apk banandi-movie.apk
+          else
+            cp banandi-movie-unsigned.apk banandi-movie.apk
+          fi
+          
+          ls -lh banandi-movie.apk
+          echo "✅ Final APK ready: banandi-movie.apk"
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Banandi-Movie-APK
+          path: banandi-movie.apk
+          retention-days: 90
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "Banandi Movie v1.0.${{ github.run_number }}"
+          body: |
+            ## 🎬 Banandi Movie v1.0.${{ github.run_number }}
+            
+            Build automatique généré le ${{ github.event.head_commit.timestamp }}
+            
+            ### Installation
+            1. Téléchargez `banandi-movie.apk` ci-dessous
+            2. Sur votre Android : **Paramètres → Sécurité → Sources inconnues** ✅
+            3. Ouvrez le fichier APK et installez
+            
+            ### Notes
+            - Compatible Android 7.0+ (API 24)
+            - Connexion internet requise pour le streaming
+          files: banandi-movie.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
