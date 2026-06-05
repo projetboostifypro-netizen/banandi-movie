@@ -1,0 +1,4 @@
+*.keystore
+apk_decoded/
+banandi-movie-unsigned.apk
+*.log
