@@ -274,7 +274,7 @@ jobs:
             -keyalg RSA \
             -keysize 2048 \
             -validity 10000 \
-            -dname "CN=OnE+ Movie, OU=Dev, O=OnEPlus, L=Paris, ST=IDF, C=FR" \
+            -dname "CN=OnEPlus Movie, OU=Dev, O=OnEPlus, L=Paris, ST=IDF, C=FR" \
             -storepass oneplus2024 \
             -keypass oneplus2024 \
             -noprompt
