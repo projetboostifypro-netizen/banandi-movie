@@ -59,43 +59,55 @@ jobs:
           grep "app_name" decoded/res/values/strings.xml
 
       # ============================================================
-      # STEP 2 — REMOVE MINE & PROMOTION TABS VIA SMALI
+      # STEP 2 — REMOVE MINE & PROMOTION TABS (TARGETED SMALI ONLY)
       # ============================================================
-      - name: Identify tab resource IDs from public.xml
+      - name: Find tab resource IDs from decoded resources
         run: |
-          echo "=== Tab resource IDs ==="
-          grep -E 'name="selector_tab_|name="main_tab_' decoded/res/values/public.xml | head -20
+          echo "=== Selector tab drawable IDs ==="
+          grep -E 'name="selector_tab_' decoded/res/values/public.xml || true
           echo ""
-          echo "=== All tab strings ==="
-          grep -E 'name="main_tab_' decoded/res/values/strings.xml
+          echo "=== Main tab string IDs ==="
+          grep -E 'name="main_tab_' decoded/res/values/public.xml || true
+          echo ""
+          echo "=== Tab string values ==="
+          grep -E 'name="main_tab_' decoded/res/values/strings.xml || true
 
-      - name: Find smali files containing tab resource references
+      - name: Find and debug smali tab configuration file
         run: |
           python3 << 'PYEOF'
           import os, re, glob
 
-          # Resource IDs to find and neutralize
-          # These are the Mine and Promotion/SmallVideo/Spiel tabs
-          MINE_IDS = {
-              'selector_tab_mine':    '0x7f0804e4',
-              'main_tab_mine':        '0x7f120154',
-              'selector_tab_small':   '0x7f0804e6',   # small_video / Promotion tab
-              'main_tab_small_video': '0x7f120156',
-          }
+          # Known selector_tab_* resource IDs (from public.xml analysis)
+          # These appear together ONLY in the tab initialization method
+          KNOWN_TAB_IDS = [
+              '7f0804e1',  # selector_tab_channel
+              '7f0804e2',  # selector_tab_home
+              '7f0804e3',  # selector_tab_home_color
+              '7f0804e4',  # selector_tab_mine
+              '7f0804e5',  # selector_tab_rank
+              '7f0804e6',  # selector_tab_small_video / Promotion
+          ]
 
-          # IDs to replace them with (home tab — safe, no crash)
-          HOME_IDS = {
-              'selector_tab_home': '0x7f0804e2',
-              'main_tab_home':     '0x7f120153',
-          }
+          # Also check main_tab_* string IDs
+          KNOWN_STRING_IDS = [
+              '7f120152',  # main_tab_channel
+              '7f120153',  # main_tab_home
+              '7f120154',  # main_tab_mine
+              '7f120155',  # main_tab_rank
+              '7f120156',  # main_tab_small_video
+          ]
 
-          print("Looking for smali files referencing mine/promotion tab IDs...")
-          print("Target IDs:", list(MINE_IDS.values()))
+          ALL_TAB_IDS = KNOWN_TAB_IDS + KNOWN_STRING_IDS
 
-          smali_dirs = glob.glob('decoded/smali*')
-          print(f"Smali dirs: {smali_dirs}")
+          print("Searching for smali files containing multiple tab IDs...")
+          print("(We ONLY touch files with 3+ tab IDs together)")
+          print()
 
-          found_files = set()
+          smali_dirs = sorted(glob.glob('decoded/smali*'))
+          print(f"Smali directories: {smali_dirs}")
+
+          # Count tab IDs per file
+          file_scores = {}
           for smali_dir in smali_dirs:
               for root_d, dirs, files in os.walk(smali_dir):
                   for fname in files:
@@ -103,128 +115,316 @@ jobs:
                           continue
                       fpath = os.path.join(root_d, fname)
                       try:
-                          content = open(fpath, encoding='utf-8', errors='ignore').read()
-                          for name, hex_id in MINE_IDS.items():
-                              bare = hex_id.lower()  # 0x7f0804e4
-                              if bare in content.lower():
-                                  found_files.add(fpath)
-                                  print(f"  FOUND {name} ({hex_id}) in {fpath}")
+                          content = open(fpath, encoding='utf-8', errors='ignore').read().lower()
+                          score = sum(1 for tid in ALL_TAB_IDS if tid in content)
+                          if score >= 2:
+                              file_scores[fpath] = score
                       except:
                           pass
 
-          print(f"\nTotal smali files with tab references: {len(found_files)}")
+          # Sort by score descending
+          ranked = sorted(file_scores.items(), key=lambda x: -x[1])
+          print(f"Files with 2+ tab IDs (ranked by count):")
+          for fp, score in ranked[:15]:
+              print(f"  [{score:2d} IDs] {fp}")
 
-          # Show context around each found reference
-          for fpath in sorted(found_files):
-              print(f"\n{'='*70}")
-              print(f"FILE: {fpath}")
-              lines = open(fpath, encoding='utf-8', errors='ignore').read().split('\n')
+          print()
+
+          # The tab configuration file should have the highest score
+          # Show detailed content of top candidates
+          for fp, score in ranked[:5]:
+              print(f"\n{'='*80}")
+              print(f"CANDIDATE FILE [{score} tab IDs]: {fp}")
+              print('='*80)
+              lines = open(fp, encoding='utf-8', errors='ignore').read().split('\n')
               for i, line in enumerate(lines):
-                  if any(v.lower().replace('0x','') in line.lower() for v in MINE_IDS.values()):
-                      start = max(0, i-8)
-                      end = min(len(lines), i+12)
-                      print(f"\n  [Line {i}: mine/promo reference]")
+                  line_lower = line.lower()
+                  if any(tid in line_lower for tid in ALL_TAB_IDS):
+                      start = max(0, i-10)
+                      end = min(len(lines), i+15)
+                      print(f"\n  --- Tab ID reference at line {i} ---")
                       for j in range(start, end):
                           marker = ">>>" if j == i else "   "
-                          print(f"  {marker} {j:4d}: {lines[j]}")
+                          print(f"  {marker} L{j:4d}: {lines[j]}")
 
-          # Save found files list for next step
-          with open('/tmp/smali_with_tabs.txt', 'w') as f:
-              for fp in sorted(found_files):
-                  f.write(fp + '\n')
+          # Save the best candidate
+          if ranked:
+              best_file, best_score = ranked[0]
+              print(f"\n🎯 BEST CANDIDATE: {best_file} (score={best_score})")
+              with open('/tmp/tab_config_file.txt', 'w') as f:
+                  f.write(best_file)
+          else:
+              print("❌ No tab configuration file found!")
+              with open('/tmp/tab_config_file.txt', 'w') as f:
+                  f.write('')
 
-          print("\n✅ Done. Files saved to /tmp/smali_with_tabs.txt")
           PYEOF
 
-      - name: Remove Mine and Promotion tabs from smali
+      - name: Remove Mine and Promotion tabs (TARGETED - only tab config files)
         run: |
           python3 << 'PYEOF'
           import os, re, glob
 
-          # Mine tab IDs → replace with home tab IDs
-          REPLACEMENTS = {
-              '0x7f0804e4': '0x7f0804e2',  # selector_tab_mine  → selector_tab_home
-              '0x7f120154': '0x7f120153',  # main_tab_mine      → main_tab_home
-              '0x7f0804e6': '0x7f0804e2',  # selector_tab_small → selector_tab_home
-              '0x7f120156': '0x7f120153',  # main_tab_small_video→ main_tab_home
-          }
+          # ── 1. Build a complete ID map from decoded public.xml ──────────────
+          # Parse ALL selector_tab and main_tab IDs dynamically
+          import xml.etree.ElementTree as ET
 
-          # Also look for decimal versions of these IDs
-          def hex_to_dec(h):
-              v = int(h, 16)
-              # Android may use signed 32-bit
-              if v > 0x7FFFFFFF:
-                  v -= 0x100000000
-              return str(v)
+          pub_xml = 'decoded/res/values/public.xml'
+          selector_ids = {}   # name → hex id
+          string_ids = {}     # name → hex id
 
-          DEC_REPLACEMENTS = {}
-          for old_hex, new_hex in REPLACEMENTS.items():
-              DEC_REPLACEMENTS[hex_to_dec(old_hex)] = hex_to_dec(new_hex)
+          try:
+              tree = ET.parse(pub_xml)
+              for elem in tree.findall('.//public'):
+                  name = elem.get('name', '')
+                  id_val = elem.get('id', '')
+                  if name.startswith('selector_tab_'):
+                      selector_ids[name] = id_val.lower()
+                  elif name.startswith('main_tab_'):
+                      string_ids[name] = id_val.lower()
+              print("Selector tab IDs found:")
+              for k, v in sorted(selector_ids.items()):
+                  print(f"  {k}: {v}")
+              print("Main tab string IDs found:")
+              for k, v in sorted(string_ids.items()):
+                  print(f"  {k}: {v}")
+          except Exception as e:
+              print(f"Error parsing public.xml: {e}")
+              # Fallback to known values
+              selector_ids = {
+                  'selector_tab_channel':    '0x7f0804e1',
+                  'selector_tab_home':       '0x7f0804e2',
+                  'selector_tab_home_color': '0x7f0804e3',
+                  'selector_tab_mine':       '0x7f0804e4',
+                  'selector_tab_rank':       '0x7f0804e5',
+                  'selector_tab_small_video':'0x7f0804e6',
+              }
+              string_ids = {
+                  'main_tab_channel':    '0x7f120152',
+                  'main_tab_home':       '0x7f120153',
+                  'main_tab_mine':       '0x7f120154',
+                  'main_tab_rank':       '0x7f120155',
+                  'main_tab_small_video':'0x7f120156',
+              }
 
-          print("Hex replacements:", REPLACEMENTS)
-          print("Decimal replacements:", DEC_REPLACEMENTS)
+          # Normalize id values to bare hex (without 0x)
+          def bare(v):
+              return v.lower().lstrip('0x') if v else v
 
-          # Find all smali files
-          smali_dirs = glob.glob('decoded/smali*')
-          all_smali = []
+          ALL_TAB_BARE = set()
+          for v in list(selector_ids.values()) + list(string_ids.values()):
+              ALL_TAB_BARE.add(bare(v))
+
+          # ── 2. Find smali files that are tab configuration files ─────────────
+          # A tab config file contains 3+ different tab IDs in the same method
+          # This is the ONLY file we should modify
+          smali_dirs = sorted(glob.glob('decoded/smali*'))
+          file_scores = {}
           for smali_dir in smali_dirs:
               for root_d, dirs, files in os.walk(smali_dir):
                   for fname in files:
-                      if fname.endswith('.smali'):
-                          all_smali.append(os.path.join(root_d, fname))
+                      if not fname.endswith('.smali'):
+                          continue
+                      fpath = os.path.join(root_d, fname)
+                      try:
+                          content = open(fpath, encoding='utf-8', errors='ignore').read().lower()
+                          score = sum(1 for tid in ALL_TAB_BARE if tid in content)
+                          if score >= 3:
+                              file_scores[fpath] = score
+                      except:
+                          pass
 
+          ranked = sorted(file_scores.items(), key=lambda x: -x[1])
+          print(f"\nTab config candidates (score ≥ 3):")
+          for fp, sc in ranked[:10]:
+              print(f"  [{sc}] {fp}")
+
+          if not ranked:
+              print("❌ No tab config file found with 3+ tab IDs. Aborting smali modification.")
+              exit(0)
+
+          # ── 3. Identify Mine and Promotion target IDs ────────────────────────
+          # Mine tab uses: selector_tab_mine + main_tab_mine
+          mine_selector = selector_ids.get('selector_tab_mine', '0x7f0804e4')
+          mine_string   = string_ids.get('main_tab_mine', '0x7f120154')
+          # Promotion/SmallVideo tab uses: selector_tab_small_video + main_tab_small_video
+          small_selector = selector_ids.get('selector_tab_small_video', '0x7f0804e6')
+          small_string   = string_ids.get('main_tab_small_video', '0x7f120156')
+          # Also check spiel tab (Jeu/Game which might be Promotion)
+          spiel_selector = selector_ids.get('selector_tab_spiel', '')
+          spiel_string   = string_ids.get('main_tab_spiel', '')
+
+          REMOVE_IDS = {
+              bare(mine_selector), bare(mine_string),
+              bare(small_selector), bare(small_string),
+          }
+          if spiel_selector:
+              REMOVE_IDS.add(bare(spiel_selector))
+          if spiel_string:
+              REMOVE_IDS.add(bare(spiel_string))
+
+          print(f"\nTarget IDs to remove: {REMOVE_IDS}")
+
+          # ── 4. Process each candidate file ───────────────────────────────────
+          # Strategy: parse smali method boundaries, find tab setup methods,
+          # remove only the blocks that reference Mine or Promotion IDs
           total_modified = 0
-          for fpath in all_smali:
-              try:
-                  content = open(fpath, encoding='utf-8', errors='ignore').read()
-                  original = content
 
-                  # Apply hex replacements (case-insensitive)
-                  for old, new in REPLACEMENTS.items():
-                      # Match both upper and lower case hex
-                      pattern = re.compile(re.escape(old), re.IGNORECASE)
-                      content = pattern.sub(new, content)
+          for fpath, score in ranked[:3]:  # Only top 3 candidates
+              print(f"\n{'='*70}")
+              print(f"Processing: {fpath} (score={score})")
 
-                  # Apply decimal replacements
-                  for old, new in DEC_REPLACEMENTS.items():
-                      # Only replace if it looks like a standalone number in smali
-                      content = re.sub(
-                          r'\b' + re.escape(old) + r'\b',
-                          new,
-                          content
-                      )
+              content = open(fpath, encoding='utf-8', errors='ignore').read()
+              lines = content.split('\n')
 
-                  if content != original:
-                      with open(fpath, 'w', encoding='utf-8') as f:
-                          f.write(content)
-                      total_modified += 1
-                      print(f"✅ Modified: {os.path.basename(fpath)}")
-              except Exception as e:
-                  print(f"Error processing {fpath}: {e}")
+              # Find lines containing target IDs
+              target_lines = set()
+              for i, line in enumerate(lines):
+                  if any(rid in line.lower() for rid in REMOVE_IDS):
+                      target_lines.add(i)
 
-          print(f"\nTotal smali files modified: {total_modified}")
+              print(f"Lines with target IDs: {sorted(target_lines)}")
 
-          if total_modified == 0:
-              print("⚠️  No smali files modified! The tab IDs were not found in smali.")
-              print("   The tabs may still be visible. Check the debug output above.")
+              if not target_lines:
+                  print("  No target IDs found - skipping")
+                  continue
+
+              # For each target line, find the surrounding "add tab" block
+              # In smali, a tab is typically added via a sequence of:
+              #   new-instance vX, LTabModel;  (or similar)
+              #   const vX, 0xID_SELECTOR
+              #   const vX, 0xID_STRING
+              #   invoke-virtual ... (add to list)
+              # We need to find the block boundaries
+
+              # Method: find which "invoke" calls surround the target lines
+              # and remove the block of code between tab additions
+
+              # Simpler approach: comment out lines that contain target IDs
+              # and the lines immediately around them that form the tab block
+              # Look for the pattern: lines grouped near a target ID
+
+              new_lines = []
+              skip_ranges = set()
+
+              for target_i in sorted(target_lines):
+                  # Extend search window: look ±20 lines for block boundaries
+                  search_start = max(0, target_i - 20)
+                  search_end   = min(len(lines), target_i + 20)
+
+                  # Find the start of the "add tab" block
+                  # Look backward for the new-instance or array-put that starts this tab
+                  block_start = target_i
+                  for j in range(target_i - 1, search_start - 1, -1):
+                      line_j = lines[j].strip()
+                      # Block boundaries: empty line, .line directive at distance,
+                      # or an invoke that's before our tab
+                      if (line_j == '' and j < target_i - 3):
+                          block_start = j + 1
+                          break
+                      # If we hit an invoke-virtual that adds an item before our target
+                      # and the very next line starts a new-instance, that's our boundary
+                      if 'new-instance' in line_j or 'new-array' in line_j:
+                          block_start = j
+                          break
+                      if line_j.startswith('.line') and j < target_i - 3:
+                          block_start = j
+                          break
+                  else:
+                      block_start = search_start
+
+                  # Find the end of the "add tab" block
+                  # Look forward for the invoke that adds this tab to the list
+                  block_end = target_i
+                  for j in range(target_i + 1, search_end):
+                      line_j = lines[j].strip()
+                      if 'invoke-virtual' in line_j or 'invoke-interface' in line_j:
+                          block_end = j
+                          break
+                      if line_j == '' and j > target_i + 3:
+                          block_end = j - 1
+                          break
+                  else:
+                      block_end = min(len(lines) - 1, target_i + 8)
+
+                  # Add this range to skip
+                  for k in range(block_start, block_end + 1):
+                      skip_ranges.add(k)
+                  print(f"  Will comment out lines {block_start}–{block_end} (target at {target_i})")
+
+              # Build new content with target blocks commented out
+              modified = False
+              for i, line in enumerate(lines):
+                  if i in skip_ranges:
+                      new_lines.append('    # REMOVED: ' + line)
+                      modified = True
+                  else:
+                      new_lines.append(line)
+
+              if modified:
+                  with open(fpath, 'w', encoding='utf-8') as f:
+                      f.write('\n'.join(new_lines))
+                  total_modified += 1
+                  print(f"  ✅ Modified {fpath}")
+              else:
+                  print(f"  ⚠️  No changes made to {fpath}")
+
+          print(f"\n✅ Total smali files modified: {total_modified}")
           PYEOF
 
-      - name: Clear Mine tab string labels
+      - name: Verify smali changes (show modified sections)
         run: |
-          # Clear Mine tab label
+          python3 << 'PYEOF'
+          import glob, os
+
+          TAB_BARE = ['7f0804e4', '7f120154', '7f0804e6', '7f120156']
+          smali_dirs = sorted(glob.glob('decoded/smali*'))
+
+          print("Checking for remaining mine/promotion tab references...")
+          remaining = []
+          for smali_dir in smali_dirs:
+              for root_d, dirs, files in os.walk(smali_dir):
+                  for fname in files:
+                      if not fname.endswith('.smali'):
+                          continue
+                      fpath = os.path.join(root_d, fname)
+                      try:
+                          content = open(fpath, encoding='utf-8', errors='ignore').read().lower()
+                          for tid in TAB_BARE:
+                              if tid in content:
+                                  # Check if it's only in REMOVED comments
+                                  active_refs = [ln for ln in content.split('\n')
+                                                 if tid in ln and '# REMOVED' not in ln]
+                                  if active_refs:
+                                      remaining.append((fpath, tid, active_refs[:3]))
+                      except:
+                          pass
+
+          if remaining:
+              print(f"\n⚠️  Found {len(remaining)} remaining active references to tab IDs:")
+              for fp, tid, lines in remaining[:10]:
+                  print(f"\n  File: {fp}, ID: {tid}")
+                  for ln in lines:
+                      print(f"    {ln[:100]}")
+          else:
+              print("✅ All mine/promotion tab IDs successfully removed or commented out!")
+          PYEOF
+
+      - name: Clear Mine and Promotion tab string labels
+        run: |
+          # Replace with empty (space) so tab labels show nothing
           sed -i 's|<string name="main_tab_mine">.*</string>|<string name="main_tab_mine"> </string>|g' \
             decoded/res/values/strings.xml
-          # Clear SmallVideo / Promotion tab label
           sed -i 's|<string name="main_tab_small_video">.*</string>|<string name="main_tab_small_video"> </string>|g' \
             decoded/res/values/strings.xml
           sed -i 's|<string name="main_tab_spiel">.*</string>|<string name="main_tab_spiel"> </string>|g' \
             decoded/res/values/strings.xml
-          # Clear promotion-related strings
           sed -i 's|<string name="str_mine_extension">.*</string>|<string name="str_mine_extension"> </string>|g' \
             decoded/res/values/strings.xml
           sed -i 's|<string name="str_promotion">.*</string>|<string name="str_promotion"> </string>|g' \
             decoded/res/values/strings.xml
           echo "✅ Tab label strings cleared"
+          grep -E "main_tab_" decoded/res/values/strings.xml
 
       # ============================================================
       # STEP 3 — GENERATE NEW OnE+ LOGO
@@ -317,7 +517,7 @@ jobs:
       # ============================================================
       # STEP 5 — BUILD, SIGN & RELEASE
       # ============================================================
-      - name: Verify all changes
+      - name: Verify all changes before build
         run: |
           echo "=== App name ==="
           grep "app_name" decoded/res/values/strings.xml
@@ -384,9 +584,8 @@ jobs:
           body: |
             ## 🎬 OnE+ movie v3.0.${{ github.run_number }}
 
-            ### Corrections
-            - ✅ Erreur vidéo corrigée (lecture vidéo fonctionnelle)
-            - ✅ Onglets "Le mien" et "Promotion" supprimés via smali
+            ### Corrections appliquées
+            - ✅ Onglets "Le mien" et "Promotion" supprimés (smali ciblé uniquement)
             - ✅ Application renommée **OnE+ movie**
             - ✅ Nouveau logo **OnE+**
             - ✅ Nouvel écran de démarrage
