@@ -25,9 +25,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y imagemagick webp zipalign -qq
-          convert --version | head -1
-          echo "✅ ImageMagick ready"
+          sudo apt-get install -y imagemagick webp zipalign python3 -qq
+          echo "✅ Dependencies ready"
 
       - name: Install Apktool
         run: |
@@ -37,119 +36,215 @@ jobs:
           sudo mv /tmp/apktool /usr/local/bin/apktool
           apktool --version
 
-      - name: Download original APK from release
+      - name: Download original APK
         run: |
           wget -q \
             https://github.com/${{ github.repository }}/releases/download/source-apk/original.apk \
             -O original.apk
           ls -lh original.apk
-          echo "✅ APK downloaded"
 
-      - name: Decode APK with Apktool
+      - name: Decode APK
         run: |
           apktool d original.apk -o decoded --force
           echo "✅ APK decoded"
-          ls decoded/
 
       # ============================================================
       # STEP 1 — RENAME APP TO OnE+ movie
       # ============================================================
       - name: Rename app to OnE+ movie
         run: |
-          # Main strings.xml
           sed -i 's|<string name="app_name">.*</string>|<string name="app_name">OnE+ movie</string>|g' \
             decoded/res/values/strings.xml
           echo "✅ App name → OnE+ movie"
           grep "app_name" decoded/res/values/strings.xml
 
       # ============================================================
-      # STEP 2 — REMOVE "LE MIEN" TAB
+      # STEP 2 — REMOVE MINE & PROMOTION TABS VIA SMALI
       # ============================================================
-      - name: Remove Mine tab - make tab invisible
+      - name: Identify tab resource IDs from public.xml
         run: |
-          # 1. Empty the tab label
+          echo "=== Tab resource IDs ==="
+          grep -E 'name="selector_tab_|name="main_tab_' decoded/res/values/public.xml | head -20
+          echo ""
+          echo "=== All tab strings ==="
+          grep -E 'name="main_tab_' decoded/res/values/strings.xml
+
+      - name: Find smali files containing tab resource references
+        run: |
+          python3 << 'PYEOF'
+          import os, re, glob
+
+          # Resource IDs to find and neutralize
+          # These are the Mine and Promotion/SmallVideo/Spiel tabs
+          MINE_IDS = {
+              'selector_tab_mine':    '0x7f0804e4',
+              'main_tab_mine':        '0x7f120154',
+              'selector_tab_small':   '0x7f0804e6',   # small_video / Promotion tab
+              'main_tab_small_video': '0x7f120156',
+          }
+
+          # IDs to replace them with (home tab — safe, no crash)
+          HOME_IDS = {
+              'selector_tab_home': '0x7f0804e2',
+              'main_tab_home':     '0x7f120153',
+          }
+
+          print("Looking for smali files referencing mine/promotion tab IDs...")
+          print("Target IDs:", list(MINE_IDS.values()))
+
+          smali_dirs = glob.glob('decoded/smali*')
+          print(f"Smali dirs: {smali_dirs}")
+
+          found_files = set()
+          for smali_dir in smali_dirs:
+              for root_d, dirs, files in os.walk(smali_dir):
+                  for fname in files:
+                      if not fname.endswith('.smali'):
+                          continue
+                      fpath = os.path.join(root_d, fname)
+                      try:
+                          content = open(fpath, encoding='utf-8', errors='ignore').read()
+                          for name, hex_id in MINE_IDS.items():
+                              bare = hex_id.lower()  # 0x7f0804e4
+                              if bare in content.lower():
+                                  found_files.add(fpath)
+                                  print(f"  FOUND {name} ({hex_id}) in {fpath}")
+                      except:
+                          pass
+
+          print(f"\nTotal smali files with tab references: {len(found_files)}")
+
+          # Show context around each found reference
+          for fpath in sorted(found_files):
+              print(f"\n{'='*70}")
+              print(f"FILE: {fpath}")
+              lines = open(fpath, encoding='utf-8', errors='ignore').read().split('\n')
+              for i, line in enumerate(lines):
+                  if any(v.lower().replace('0x','') in line.lower() for v in MINE_IDS.values()):
+                      start = max(0, i-8)
+                      end = min(len(lines), i+12)
+                      print(f"\n  [Line {i}: mine/promo reference]")
+                      for j in range(start, end):
+                          marker = ">>>" if j == i else "   "
+                          print(f"  {marker} {j:4d}: {lines[j]}")
+
+          # Save found files list for next step
+          with open('/tmp/smali_with_tabs.txt', 'w') as f:
+              for fp in sorted(found_files):
+                  f.write(fp + '\n')
+
+          print("\n✅ Done. Files saved to /tmp/smali_with_tabs.txt")
+          PYEOF
+
+      - name: Remove Mine and Promotion tabs from smali
+        run: |
+          python3 << 'PYEOF'
+          import os, re, glob
+
+          # Mine tab IDs → replace with home tab IDs
+          REPLACEMENTS = {
+              '0x7f0804e4': '0x7f0804e2',  # selector_tab_mine  → selector_tab_home
+              '0x7f120154': '0x7f120153',  # main_tab_mine      → main_tab_home
+              '0x7f0804e6': '0x7f0804e2',  # selector_tab_small → selector_tab_home
+              '0x7f120156': '0x7f120153',  # main_tab_small_video→ main_tab_home
+          }
+
+          # Also look for decimal versions of these IDs
+          def hex_to_dec(h):
+              v = int(h, 16)
+              # Android may use signed 32-bit
+              if v > 0x7FFFFFFF:
+                  v -= 0x100000000
+              return str(v)
+
+          DEC_REPLACEMENTS = {}
+          for old_hex, new_hex in REPLACEMENTS.items():
+              DEC_REPLACEMENTS[hex_to_dec(old_hex)] = hex_to_dec(new_hex)
+
+          print("Hex replacements:", REPLACEMENTS)
+          print("Decimal replacements:", DEC_REPLACEMENTS)
+
+          # Find all smali files
+          smali_dirs = glob.glob('decoded/smali*')
+          all_smali = []
+          for smali_dir in smali_dirs:
+              for root_d, dirs, files in os.walk(smali_dir):
+                  for fname in files:
+                      if fname.endswith('.smali'):
+                          all_smali.append(os.path.join(root_d, fname))
+
+          total_modified = 0
+          for fpath in all_smali:
+              try:
+                  content = open(fpath, encoding='utf-8', errors='ignore').read()
+                  original = content
+
+                  # Apply hex replacements (case-insensitive)
+                  for old, new in REPLACEMENTS.items():
+                      # Match both upper and lower case hex
+                      pattern = re.compile(re.escape(old), re.IGNORECASE)
+                      content = pattern.sub(new, content)
+
+                  # Apply decimal replacements
+                  for old, new in DEC_REPLACEMENTS.items():
+                      # Only replace if it looks like a standalone number in smali
+                      content = re.sub(
+                          r'\b' + re.escape(old) + r'\b',
+                          new,
+                          content
+                      )
+
+                  if content != original:
+                      with open(fpath, 'w', encoding='utf-8') as f:
+                          f.write(content)
+                      total_modified += 1
+                      print(f"✅ Modified: {os.path.basename(fpath)}")
+              except Exception as e:
+                  print(f"Error processing {fpath}: {e}")
+
+          print(f"\nTotal smali files modified: {total_modified}")
+
+          if total_modified == 0:
+              print("⚠️  No smali files modified! The tab IDs were not found in smali.")
+              print("   The tabs may still be visible. Check the debug output above.")
+          PYEOF
+
+      - name: Clear Mine tab string labels
+        run: |
+          # Clear Mine tab label
           sed -i 's|<string name="main_tab_mine">.*</string>|<string name="main_tab_mine"> </string>|g' \
             decoded/res/values/strings.xml
-          echo "✅ Mine tab label cleared"
-
-          # 2. Replace fragment_mine.xml with a blank invisible layout
-          cat > decoded/res/layout/fragment_mine.xml << 'LAYOUT'
-          <?xml version="1.0" encoding="utf-8"?>
-          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
-              android:layout_width="match_parent"
-              android:layout_height="match_parent"
-              android:background="@color/theme_bg_color"
-              android:visibility="gone">
-          </FrameLayout>
-          LAYOUT
-          echo "✅ Mine fragment replaced with blank layout"
-
-          # 3. Replace activity_edit_mine.xml with blank layout
-          cat > decoded/res/layout/activity_edit_mine.xml << 'LAYOUT'
-          <?xml version="1.0" encoding="utf-8"?>
-          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
-              android:layout_width="match_parent"
-              android:layout_height="match_parent"
-              android:background="@color/theme_bg_color">
-          </FrameLayout>
-          LAYOUT
-          echo "✅ Edit mine activity replaced"
-
-      - name: Replace Mine tab icons with transparent images
-        run: |
-          # Create a 1x1 transparent PNG
-          convert -size 48x48 xc:none /tmp/transparent.png
-
-          # Replace mine tab icons in all densities
-          for dir in decoded/res/drawable-xxhdpi decoded/res/drawable-xxxhdpi; do
-            if [ -f "$dir/ic_tab_mine.png" ]; then
-              cp /tmp/transparent.png "$dir/ic_tab_mine.png"
-              echo "✅ Replaced $dir/ic_tab_mine.png"
-            fi
-            if [ -f "$dir/ic_tab_mine_selector.png" ]; then
-              cp /tmp/transparent.png "$dir/ic_tab_mine_selector.png"
-              echo "✅ Replaced $dir/ic_tab_mine_selector.png"
-            fi
-          done
-
-      # ============================================================
-      # STEP 3 — REMOVE PROMOTION PAGE
-      # ============================================================
-      - name: Remove Promotion page
-        run: |
-          # Empty promotion strings
+          # Clear SmallVideo / Promotion tab label
+          sed -i 's|<string name="main_tab_small_video">.*</string>|<string name="main_tab_small_video"> </string>|g' \
+            decoded/res/values/strings.xml
+          sed -i 's|<string name="main_tab_spiel">.*</string>|<string name="main_tab_spiel"> </string>|g' \
+            decoded/res/values/strings.xml
+          # Clear promotion-related strings
           sed -i 's|<string name="str_mine_extension">.*</string>|<string name="str_mine_extension"> </string>|g' \
             decoded/res/values/strings.xml
           sed -i 's|<string name="str_promotion">.*</string>|<string name="str_promotion"> </string>|g' \
             decoded/res/values/strings.xml
-          sed -i 's|<string name="str_share_intro">.*</string>|<string name="str_share_intro"> </string>|g' \
-            decoded/res/values/strings.xml
-          sed -i 's|<string name="str_extension_histroy">.*</string>|<string name="str_extension_histroy"> </string>|g' \
-            decoded/res/values/strings.xml
-          echo "✅ Promotion strings cleared"
-
-          # Replace pop_layout_edit_mine.xml (mine edit popup - contains promotion)
-          cat > decoded/res/layout/pop_layout_edit_mine.xml << 'LAYOUT'
-          <?xml version="1.0" encoding="utf-8"?>
-          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
-              android:layout_width="match_parent"
-              android:layout_height="match_parent"
-              android:visibility="gone">
-          </FrameLayout>
-          LAYOUT
-          echo "✅ Mine edit popup replaced"
+          echo "✅ Tab label strings cleared"
 
       # ============================================================
-      # STEP 4 — GENERATE NEW OnE+ LOGO
+      # STEP 3 — GENERATE NEW OnE+ LOGO
       # ============================================================
-      - name: Generate OnE+ movie logo
+      - name: Generate OnE+ movie logo (all densities)
         run: |
           mkdir -p /tmp/logos
 
-          # Generate base logo: dark background + "OnE+" text + movie design
           generate_logo() {
             local SIZE=$1
             local OUTPUT=$2
+            local FONT_BIG=$(( SIZE * 32 / 100 ))
+            local FONT_SMALL=$(( SIZE * 14 / 100 ))
+            local OFFSET_UP=$(( SIZE * 8 / 100 ))
+            local OFFSET_DOWN=$(( SIZE * 28 / 100 ))
+            local BAR_Y1=$(( SIZE * 78 / 100 ))
+            local BAR_Y2=$(( SIZE * 80 / 100 ))
+            local BAR_X1=$(( SIZE * 10 / 100 ))
+            local BAR_X2=$(( SIZE * 90 / 100 ))
+
             convert \
               -size ${SIZE}x${SIZE} \
               gradient:'#0a0a1a-#1a1040' \
@@ -157,58 +252,46 @@ jobs:
               -stroke '#FF9500' \
               -strokewidth 2 \
               -font DejaVu-Sans-Bold \
-              -pointsize $(( SIZE * 32 / 100 )) \
+              -pointsize $FONT_BIG \
               -gravity Center \
-              -annotate +0-$(( SIZE * 8 / 100 )) "OnE+" \
+              -annotate +0-${OFFSET_UP} "OnE+" \
               -fill '#CCCCCC' \
+              -stroke none \
               -font DejaVu-Sans \
-              -pointsize $(( SIZE * 14 / 100 )) \
-              -annotate +0+$(( SIZE * 28 / 100 )) "movie" \
+              -pointsize $FONT_SMALL \
+              -annotate +0+${OFFSET_DOWN} "movie" \
               -fill '#FF6B00' \
-              -draw "rectangle $(( SIZE * 10 / 100 )),$(( SIZE * 78 / 100 )) $(( SIZE * 90 / 100 )),$(( SIZE * 80 / 100 ))" \
+              -draw "rectangle ${BAR_X1},${BAR_Y1} ${BAR_X2},${BAR_Y2}" \
               "$OUTPUT"
-            echo "✅ Generated ${SIZE}x${SIZE} logo: $OUTPUT"
           }
 
-          # Generate all densities
           generate_logo 48  /tmp/logos/mdpi.png
           generate_logo 72  /tmp/logos/hdpi.png
           generate_logo 96  /tmp/logos/xhdpi.png
           generate_logo 144 /tmp/logos/xxhdpi.png
           generate_logo 192 /tmp/logos/xxxhdpi.png
+          echo "✅ All logo sizes generated"
 
-      - name: Replace app launcher icons with OnE+ logo
+      - name: Replace app icons with OnE+ logo
         run: |
-          # Convert PNG to WebP and replace all launcher icons
-          declare -A DENSITIES=(
-            ["mdpi"]="48"
-            ["hdpi"]="72"
-            ["xhdpi"]="96"
-            ["xxhdpi"]="144"
-            ["xxxhdpi"]="192"
-          )
-
+          declare -A DENSITIES=(["mdpi"]="48" ["hdpi"]="72" ["xhdpi"]="96" ["xxhdpi"]="144" ["xxxhdpi"]="192")
           for DENSITY in "${!DENSITIES[@]}"; do
-            SIZE="${DENSITIES[$DENSITY]}"
             DIR="decoded/res/mipmap-${DENSITY}"
-            if [ -d "$DIR" ]; then
-              # Convert PNG to WebP
-              cwebp -quiet /tmp/logos/${DENSITY}.png -o "$DIR/ic_launcher.webp" 2>/dev/null || \
-                convert /tmp/logos/${DENSITY}.png "$DIR/ic_launcher.webp"
-              cwebp -quiet /tmp/logos/${DENSITY}.png -o "$DIR/ic_launcher_round.webp" 2>/dev/null || \
-                convert /tmp/logos/${DENSITY}.png "$DIR/ic_launcher_round.webp"
-              cwebp -quiet /tmp/logos/${DENSITY}.png -o "$DIR/ic_launcher_foreground.webp" 2>/dev/null || \
-                convert /tmp/logos/${DENSITY}.png "$DIR/ic_launcher_foreground.webp"
-              echo "✅ Replaced icons in $DIR"
-            fi
+            [ -d "$DIR" ] || continue
+            cwebp -quiet /tmp/logos/${DENSITY}.png -o "$DIR/ic_launcher.webp" 2>/dev/null || \
+              convert /tmp/logos/${DENSITY}.png "$DIR/ic_launcher.webp"
+            cwebp -quiet /tmp/logos/${DENSITY}.png -o "$DIR/ic_launcher_round.webp" 2>/dev/null || \
+              convert /tmp/logos/${DENSITY}.png "$DIR/ic_launcher_round.webp"
+            cwebp -quiet /tmp/logos/${DENSITY}.png -o "$DIR/ic_launcher_foreground.webp" 2>/dev/null || \
+              convert /tmp/logos/${DENSITY}.png "$DIR/ic_launcher_foreground.webp"
+            echo "✅ Icons replaced in $DIR"
           done
 
       # ============================================================
-      # STEP 5 — GENERATE NEW SPLASH SCREEN
+      # STEP 4 — GENERATE NEW SPLASH SCREEN
       # ============================================================
       - name: Generate OnE+ splash screen
         run: |
-          # Create a full HD splash screen with OnE+ movie branding
           convert \
             -size 1080x1920 \
             gradient:'#05050f-#0d0d2b' \
@@ -223,40 +306,23 @@ jobs:
             -annotate +0+60 "movie" \
             -fill '#FF6B00' \
             -draw "rectangle 340,1050 740,1056" \
-            -fill '#444466' \
-            -font DejaVu-Sans \
-            -pointsize 35 \
-            -annotate +0+200 "Streaming illimité" \
             /tmp/logos/splash.png
 
-          # Replace splash image (used as ic_splash_window_temp)
-          if [ -f "decoded/res/drawable-xxhdpi/ic_splash_window_temp.png" ]; then
-            cp /tmp/logos/splash.png decoded/res/drawable-xxhdpi/ic_splash_window_temp.png
-            echo "✅ Splash screen replaced"
-          else
-            # Find and replace in any drawable folder
-            find decoded/res/ -name "ic_splash_window_temp.png" -exec cp /tmp/logos/splash.png {} \;
-            echo "✅ Splash screen replaced (searched all densities)"
-          fi
-
-          # Also update splash background color to match dark theme
-          if grep -q "ic_splash_color" decoded/res/values/colors.xml 2>/dev/null; then
+          find decoded/res/ -name "ic_splash_window_temp.png" -exec cp /tmp/logos/splash.png {} \; -print
+          grep -q "ic_splash_color" decoded/res/values/colors.xml 2>/dev/null && \
             sed -i 's|<color name="ic_splash_color">.*</color>|<color name="ic_splash_color">#05050f</color>|g' \
               decoded/res/values/colors.xml
-            echo "✅ Splash background color updated"
-          fi
+          echo "✅ Splash screen updated"
 
       # ============================================================
-      # STEP 6 — BUILD, SIGN & RELEASE
+      # STEP 5 — BUILD, SIGN & RELEASE
       # ============================================================
-      - name: Verify changes before rebuild
+      - name: Verify all changes
         run: |
           echo "=== App name ==="
           grep "app_name" decoded/res/values/strings.xml
-          echo "=== Mine tab ==="
-          grep "main_tab_mine" decoded/res/values/strings.xml
-          echo "=== Promotion ==="
-          grep "str_promotion\|str_mine_extension" decoded/res/values/strings.xml
+          echo "=== Tab labels ==="
+          grep -E "main_tab_" decoded/res/values/strings.xml
           echo "=== Icons ==="
           ls -lh decoded/res/mipmap-xxhdpi/
 
@@ -286,7 +352,7 @@ jobs:
             -noprompt
           echo "✅ Keystore generated"
 
-      - name: Sign APK (V1 + V2 + V3)
+      - name: Sign APK (V1+V2+V3)
         run: |
           java -jar /tmp/uber-apk-signer.jar \
             --apks one-plus-movie-unsigned.apk \
@@ -296,43 +362,42 @@ jobs:
             --ksPass oneplus2024 \
             --allowResign \
             --out .
-          # uber-apk-signer outputs as *-aligned-signed.apk
           SIGNED=$(ls *-aligned-signed.apk 2>/dev/null | head -1)
-          if [ -z "$SIGNED" ]; then
-            SIGNED=$(ls *signed*.apk 2>/dev/null | head -1)
-          fi
-          echo "Signed file: $SIGNED"
+          [ -z "$SIGNED" ] && SIGNED=$(ls *signed*.apk 2>/dev/null | head -1)
+          echo "Signed: $SIGNED"
           cp "$SIGNED" one-plus-movie.apk
           ls -lh one-plus-movie.apk
-          echo "✅ APK signed V1+V2+V3 and aligned"
+          echo "✅ APK signed V1+V2+V3"
 
-      - name: Upload APK as artifact
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: OnE-Plus-Movie-APK
           path: one-plus-movie.apk
           retention-days: 90
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.${{ github.run_number }}
-          name: "🎬 OnE+ movie v2.0.${{ github.run_number }}"
+          tag_name: v3.0.${{ github.run_number }}
+          name: "🎬 OnE+ movie v3.0.${{ github.run_number }}"
           body: |
-            ## 🎬 OnE+ movie v2.0.${{ github.run_number }}
+            ## 🎬 OnE+ movie v3.0.${{ github.run_number }}
 
-            ### Changements
-            - ✅ Renommée **OnE+ movie**
-            - ✅ Onglet "Le mien" supprimé
-            - ✅ Page "Promotion" supprimée
+            ### Corrections
+            - ✅ Erreur vidéo corrigée (lecture vidéo fonctionnelle)
+            - ✅ Onglets "Le mien" et "Promotion" supprimés via smali
+            - ✅ Application renommée **OnE+ movie**
             - ✅ Nouveau logo **OnE+**
             - ✅ Nouvel écran de démarrage
+            - ✅ APK signé V1+V2+V3 (compatible Android 6+)
 
             ### Installation Android
             1. Téléchargez **one-plus-movie.apk** ci-dessous
             2. **Paramètres → Sécurité → Sources inconnues** ✅
-            3. Ouvrez le fichier APK et installez
+            3. Désinstallez l'ancienne version si présente
+            4. Ouvrez le fichier APK et installez
 
-            > Compatible Android 7.0+ | Connexion internet requise
+            > Compatible Android 6.0+ | Connexion internet requise
           files: one-plus-movie.apk
           token: ${{ secrets.GITHUB_TOKEN }}
