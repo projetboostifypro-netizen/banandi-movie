@@ -160,66 +160,34 @@ jobs:
 
           PYEOF
 
-      - name: Remove Mine and Promotion tabs (TARGETED - only tab config files)
+      - name: Remove Mine and Promotion tabs (TARGETED - only MainActivity smali)
         run: |
           python3 << 'PYEOF'
-          import os, re, glob
+          import os, glob
 
-          # ── 1. Build a complete ID map from decoded public.xml ──────────────
-          # Parse ALL selector_tab and main_tab IDs dynamically
-          import xml.etree.ElementTree as ET
+          # ── Target: ONLY the MainActivity smali that initialises TabLayout$b items ──
+          # From previous build analysis we know:
+          #   Best file: decoded/smali_classes5/com/mfr/moviefr/ui/MainActivity.smali
+          #   Each tab = new-instance TabLayout$b … ArrayList;->add() block
+          # We scan for that file (or any smali with the TabLayout$b new-instance pattern)
+          # and ONLY modify files that ARE the tab activity class.
 
-          pub_xml = 'decoded/res/values/public.xml'
-          selector_ids = {}   # name → hex id
-          string_ids = {}     # name → hex id
+          TAB_CLASS_PATTERN = 'Lcom/mfr/moviefr/widgets/tab/TabLayout$b;'
+          LIST_ADD_PATTERN   = 'Ljava/util/ArrayList;->add(Ljava/lang/Object;)Z'
 
-          try:
-              tree = ET.parse(pub_xml)
-              for elem in tree.findall('.//public'):
-                  name = elem.get('name', '')
-                  id_val = elem.get('id', '')
-                  if name.startswith('selector_tab_'):
-                      selector_ids[name] = id_val.lower()
-                  elif name.startswith('main_tab_'):
-                      string_ids[name] = id_val.lower()
-              print("Selector tab IDs found:")
-              for k, v in sorted(selector_ids.items()):
-                  print(f"  {k}: {v}")
-              print("Main tab string IDs found:")
-              for k, v in sorted(string_ids.items()):
-                  print(f"  {k}: {v}")
-          except Exception as e:
-              print(f"Error parsing public.xml: {e}")
-              # Fallback to known values
-              selector_ids = {
-                  'selector_tab_channel':    '0x7f0804e1',
-                  'selector_tab_home':       '0x7f0804e2',
-                  'selector_tab_home_color': '0x7f0804e3',
-                  'selector_tab_mine':       '0x7f0804e4',
-                  'selector_tab_rank':       '0x7f0804e5',
-                  'selector_tab_small_video':'0x7f0804e6',
-              }
-              string_ids = {
-                  'main_tab_channel':    '0x7f120152',
-                  'main_tab_home':       '0x7f120153',
-                  'main_tab_mine':       '0x7f120154',
-                  'main_tab_rank':       '0x7f120155',
-                  'main_tab_small_video':'0x7f120156',
-              }
+          # IDs that identify tabs we want to REMOVE:
+          #   Mine:        selector_tab_mine (0x7f0804e4), main_tab_mine (0x7f120154)
+          #   SmallVideo:  selector_tab_small_video (0x7f0804e6), main_tab_small_video (0x7f120156)
+          #   Spiel:       selector_tab_spiel (0x7f0804e7), main_tab_spiel (0x7f120157)
+          REMOVE_IDS = {
+              '7f0804e4', '7f120154',   # Mine
+              '7f0804e6', '7f120156',   # SmallVideo / Promotion
+              '7f0804e7', '7f120157',   # Spiel / Jeu (extra game tab)
+          }
 
-          # Normalize id values to bare hex (without 0x)
-          def bare(v):
-              return v.lower().lstrip('0x') if v else v
-
-          ALL_TAB_BARE = set()
-          for v in list(selector_ids.values()) + list(string_ids.values()):
-              ALL_TAB_BARE.add(bare(v))
-
-          # ── 2. Find smali files that are tab configuration files ─────────────
-          # A tab config file contains 3+ different tab IDs in the same method
-          # This is the ONLY file we should modify
           smali_dirs = sorted(glob.glob('decoded/smali*'))
-          file_scores = {}
+          target_files = []
+
           for smali_dir in smali_dirs:
               for root_d, dirs, files in os.walk(smali_dir):
                   for fname in files:
@@ -227,147 +195,93 @@ jobs:
                           continue
                       fpath = os.path.join(root_d, fname)
                       try:
-                          content = open(fpath, encoding='utf-8', errors='ignore').read().lower()
-                          score = sum(1 for tid in ALL_TAB_BARE if tid in content)
-                          if score >= 3:
-                              file_scores[fpath] = score
+                          raw = open(fpath, encoding='utf-8', errors='ignore').read()
+                          # Only touch files that both:
+                          #   1. Contain new-instance TabLayout$b (so they do tab setup)
+                          #   2. Are NOT R$drawable / R$string (constant definitions)
+                          if (TAB_CLASS_PATTERN in raw
+                                  and LIST_ADD_PATTERN in raw
+                                  and 'R$drawable' not in fpath
+                                  and 'R$string'   not in fpath):
+                              target_files.append(fpath)
                       except:
                           pass
 
-          ranked = sorted(file_scores.items(), key=lambda x: -x[1])
-          print(f"\nTab config candidates (score ≥ 3):")
-          for fp, sc in ranked[:10]:
-              print(f"  [{sc}] {fp}")
+          print(f"Files with TabLayout$b new-instance AND ArrayList.add(): {target_files}")
 
-          if not ranked:
-              print("❌ No tab config file found with 3+ tab IDs. Aborting smali modification.")
+          if not target_files:
+              print("❌ No suitable file found. Aborting.")
               exit(0)
 
-          # ── 3. Identify Mine and Promotion target IDs ────────────────────────
-          # Mine tab uses: selector_tab_mine + main_tab_mine
-          mine_selector = selector_ids.get('selector_tab_mine', '0x7f0804e4')
-          mine_string   = string_ids.get('main_tab_mine', '0x7f120154')
-          # Promotion/SmallVideo tab uses: selector_tab_small_video + main_tab_small_video
-          small_selector = selector_ids.get('selector_tab_small_video', '0x7f0804e6')
-          small_string   = string_ids.get('main_tab_small_video', '0x7f120156')
-          # Also check spiel tab (Jeu/Game which might be Promotion)
-          spiel_selector = selector_ids.get('selector_tab_spiel', '')
-          spiel_string   = string_ids.get('main_tab_spiel', '')
-
-          REMOVE_IDS = {
-              bare(mine_selector), bare(mine_string),
-              bare(small_selector), bare(small_string),
-          }
-          if spiel_selector:
-              REMOVE_IDS.add(bare(spiel_selector))
-          if spiel_string:
-              REMOVE_IDS.add(bare(spiel_string))
-
-          print(f"\nTarget IDs to remove: {REMOVE_IDS}")
-
-          # ── 4. Process each candidate file ───────────────────────────────────
-          # Strategy: parse smali method boundaries, find tab setup methods,
-          # remove only the blocks that reference Mine or Promotion IDs
           total_modified = 0
 
-          for fpath, score in ranked[:3]:  # Only top 3 candidates
+          for fpath in target_files:
               print(f"\n{'='*70}")
-              print(f"Processing: {fpath} (score={score})")
+              print(f"Processing: {fpath}")
+              lines = open(fpath, encoding='utf-8', errors='ignore').read().split('\n')
 
-              content = open(fpath, encoding='utf-8', errors='ignore').read()
-              lines = content.split('\n')
+              # ── Find all TabLayout$b blocks ─────────────────────────────────
+              # A block starts at: new-instance vX, Lcom/mfr/moviefr/widgets/tab/TabLayout$b;
+              # A block ends at:   invoke-virtual {v1, vX}, Ljava/util/ArrayList;->add(...)Z
+              # (the add call may appear up to ~40 lines after the new-instance)
 
-              # Find lines containing target IDs
-              target_lines = set()
-              for i, line in enumerate(lines):
-                  if any(rid in line.lower() for rid in REMOVE_IDS):
-                      target_lines.add(i)
+              skip_lines = set()
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  if 'new-instance' in line and TAB_CLASS_PATTERN in line:
+                      block_start = i
+                      block_end   = -1
+                      # Scan forward for the ArrayList.add that closes this block
+                      for j in range(i + 1, min(i + 60, len(lines))):
+                          if LIST_ADD_PATTERN in lines[j]:
+                              block_end = j
+                              break
+                          # Stop if we hit another new-instance (next tab starts)
+                          if 'new-instance' in lines[j] and TAB_CLASS_PATTERN in lines[j]:
+                              break
 
-              print(f"Lines with target IDs: {sorted(target_lines)}")
+                      if block_end == -1:
+                          print(f"  ⚠️  Block at L{block_start} has no ArrayList.add() – skipping")
+                          i += 1
+                          continue
 
-              if not target_lines:
-                  print("  No target IDs found - skipping")
-                  continue
+                      # Check if this block contains a REMOVE_ID
+                      block_text = '\n'.join(lines[block_start:block_end + 1]).lower()
+                      matched_id = next((rid for rid in REMOVE_IDS if rid in block_text), None)
 
-              # For each target line, find the surrounding "add tab" block
-              # In smali, a tab is typically added via a sequence of:
-              #   new-instance vX, LTabModel;  (or similar)
-              #   const vX, 0xID_SELECTOR
-              #   const vX, 0xID_STRING
-              #   invoke-virtual ... (add to list)
-              # We need to find the block boundaries
-
-              # Method: find which "invoke" calls surround the target lines
-              # and remove the block of code between tab additions
-
-              # Simpler approach: comment out lines that contain target IDs
-              # and the lines immediately around them that form the tab block
-              # Look for the pattern: lines grouped near a target ID
-
-              new_lines = []
-              skip_ranges = set()
-
-              for target_i in sorted(target_lines):
-                  # Extend search window: look ±20 lines for block boundaries
-                  search_start = max(0, target_i - 20)
-                  search_end   = min(len(lines), target_i + 20)
-
-                  # Find the start of the "add tab" block
-                  # Look backward for the new-instance or array-put that starts this tab
-                  block_start = target_i
-                  for j in range(target_i - 1, search_start - 1, -1):
-                      line_j = lines[j].strip()
-                      # Block boundaries: empty line, .line directive at distance,
-                      # or an invoke that's before our tab
-                      if (line_j == '' and j < target_i - 3):
-                          block_start = j + 1
-                          break
-                      # If we hit an invoke-virtual that adds an item before our target
-                      # and the very next line starts a new-instance, that's our boundary
-                      if 'new-instance' in line_j or 'new-array' in line_j:
-                          block_start = j
-                          break
-                      if line_j.startswith('.line') and j < target_i - 3:
-                          block_start = j
-                          break
+                      if matched_id:
+                          print(f"  🗑️  Removing block L{block_start}–L{block_end} (contains {matched_id})")
+                          for k in range(block_start, block_end + 1):
+                              skip_lines.add(k)
+                          i = block_end + 1
+                      else:
+                          # Identify which tab this is (for debug)
+                          tab_name = 'unknown'
+                          if '7f0804e2' in block_text:
+                              tab_name = 'Home'
+                          elif '7f0804e5' in block_text:
+                              tab_name = 'Rank'
+                          elif '7f0804e1' in block_text:
+                              tab_name = 'Channel/Explorer'
+                          print(f"  ✅ Keeping block L{block_start}–L{block_end} (Tab: {tab_name})")
+                          i = block_end + 1
                   else:
-                      block_start = search_start
+                      i += 1
 
-                  # Find the end of the "add tab" block
-                  # Look forward for the invoke that adds this tab to the list
-                  block_end = target_i
-                  for j in range(target_i + 1, search_end):
-                      line_j = lines[j].strip()
-                      if 'invoke-virtual' in line_j or 'invoke-interface' in line_j:
-                          block_end = j
-                          break
-                      if line_j == '' and j > target_i + 3:
-                          block_end = j - 1
-                          break
-                  else:
-                      block_end = min(len(lines) - 1, target_i + 8)
-
-                  # Add this range to skip
-                  for k in range(block_start, block_end + 1):
-                      skip_ranges.add(k)
-                  print(f"  Will comment out lines {block_start}–{block_end} (target at {target_i})")
-
-              # Build new content with target blocks commented out
-              modified = False
-              for i, line in enumerate(lines):
-                  if i in skip_ranges:
-                      new_lines.append('    # REMOVED: ' + line)
-                      modified = True
-                  else:
-                      new_lines.append(line)
-
-              if modified:
+              if skip_lines:
+                  new_lines = []
+                  for idx, ln in enumerate(lines):
+                      if idx in skip_lines:
+                          new_lines.append('    # REMOVED: ' + ln)
+                      else:
+                          new_lines.append(ln)
                   with open(fpath, 'w', encoding='utf-8') as f:
                       f.write('\n'.join(new_lines))
+                  print(f"\n  ✅ Modified {fpath} – removed {len(skip_lines)} lines")
                   total_modified += 1
-                  print(f"  ✅ Modified {fpath}")
               else:
-                  print(f"  ⚠️  No changes made to {fpath}")
+                  print(f"\n  ⚠️  No blocks removed in {fpath}")
 
           print(f"\n✅ Total smali files modified: {total_modified}")
           PYEOF
